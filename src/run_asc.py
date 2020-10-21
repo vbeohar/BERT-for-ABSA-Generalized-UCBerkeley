@@ -21,17 +21,18 @@ import json
 
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 
-from pytorch_pretrained_bert.tokenization import BertTokenizer
-from pytorch_pretrained_bert.modeling import BertForSequenceClassification
-from pytorch_pretrained_bert.optimization import BertAdam
+from tokenization import BertTokenizer
+from modeling import BertModel, BertPreTrainedModel, BertLayer, BertPooler
+from optimization import BertAdam
 
 import absa_data_utils as data_utils
 from absa_data_utils import ABSATokenizer
 import modelconfig
 from math import ceil
-from bat_asc import BertForABSA
+
 
 logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt = '%m/%d/%Y %H:%M:%S',
@@ -43,15 +44,59 @@ def warmup_linear(x, warmup=0.002):
         return x/warmup
     return 1.0 - x
 
+class HSUM(nn.Module):
+    def __init__(self, count, config, num_labels):
+        super(HSUM, self).__init__()
+        self.count = count
+        self.num_labels = num_labels
+        self.pre_layers = torch.nn.ModuleList()
+        self.loss_fct = torch.nn.ModuleList()
+        self.pooler = BertPooler(config)
+        self.classifier = torch.nn.Linear(config.hidden_size, num_labels)
+        for i in range(count):
+            self.pre_layers.append(BertLayer(config))
+            self.loss_fct.append(torch.nn.CrossEntropyLoss(ignore_index=-1))
+
+    def forward(self, layers, attention_mask, labels):
+        losses = []
+        logitses = []
+        output = torch.zeros_like(layers[0])
+        total_loss = torch.Tensor(0)
+        for i in range(self.count):
+            output = output + layers[-i-1]
+            output = self.pre_layers[i](output, attention_mask)
+            out = self.pooler(output)
+            logits = self.classifier(out)
+            if labels is not None:
+                loss = self.loss_fct[i](logits.view(-1, self.num_labels), labels.view(-1))
+                losses.append(loss)
+            logitses.append(logits)
+        if labels is not None:
+            total_loss = torch.sum(torch.stack(losses), dim=0)
+        avg_logits = torch.sum(torch.stack(logitses), dim=0)/self.count
+        return total_loss, avg_logits
+
+
+class BertForABSA(BertPreTrainedModel):
+    def __init__(self, config, num_labels=3):
+        super(BertForABSA, self).__init__(config)
+        self.num_labels = num_labels
+        self.bert = BertModel(config)
+        self.hsum = HSUM(4, config, num_labels)
+        self.apply(self.init_bert_weights)
+
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None):
+        layers, _, mask = self.bert(input_ids, token_type_ids, 
+                                                        attention_mask=attention_mask, 
+                                                        output_all_encoded_layers=True)
+        loss, logits = self.hsum(layers, mask, labels)
+        if labels is not None:
+            return loss
+        else:
+            return logits
+
 def train(args):
 
-    # asc laptop best values
-    # dropout = 0.4
-    # epsilon = 5.0
-
-    # asc rest best values
-    dropout = 0.5
-    epsilon = 5.0
     processor = data_utils.AscProcessor()
     label_list = processor.get_labels()
     tokenizer = ABSATokenizer.from_pretrained(modelconfig.MODEL_ARCHIVE_MAP[args.bert_model])
@@ -98,7 +143,7 @@ def train(args):
         valid_losses=[]
     #<<<<< end of validation declaration
 
-    model = BertForABSA.from_pretrained(modelconfig.MODEL_ARCHIVE_MAP[args.bert_model], num_labels=len(label_list), dropout=dropout, epsilon=epsilon)
+    model = BertForABSA.from_pretrained(modelconfig.MODEL_ARCHIVE_MAP[args.bert_model], num_labels=len(label_list))
     model.cuda()
     # Prepare optimizer
     param_optimizer = [(k, v) for k, v in model.named_parameters() if v.requires_grad==True]
@@ -116,23 +161,24 @@ def train(args):
 
     global_step = 0
     model.train()
-    for _ in range(args.num_train_epochs):
+
+    for epoch in range(args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             batch = tuple(t.cuda() for t in batch)
             input_ids, segment_ids, input_mask, label_ids = batch
-            
-            _loss, adv_loss = model(input_ids, segment_ids, input_mask, label_ids)
-            loss = _loss + adv_loss
-            
+            optimizer.zero_grad()
+            loss = model(input_ids, segment_ids, input_mask, label_ids)
             loss.backward()
-
+            
             lr_this_step = args.learning_rate * warmup_linear(global_step/t_total, args.warmup_proportion)
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr_this_step
             optimizer.step()
-            optimizer.zero_grad()
             global_step += 1
-            #>>>> perform validation at the end of each epoch .
+        print("training loss: ", loss.item(), epoch+1)
+        #>>>> perform validation at the end of each epoch.
+        new_dirs = os.path.join(args.output_dir, str(epoch+1))
+        os.mkdir(new_dirs)
         if args.do_valid:
             model.eval()
             with torch.no_grad():
@@ -145,10 +191,15 @@ def train(args):
                     losses.append(loss.data.item()*input_ids.size(0) )
                     valid_size+=input_ids.size(0)
                 valid_loss=sum(losses)/valid_size
-                logger.info("validation loss: %f", valid_loss)
+                logger.info("validation loss: %f, epoch: %d", valid_loss, epoch+1)
                 valid_losses.append(valid_loss)
+                torch.save(model, os.path.join(new_dirs, "model.pt"))
+                test(args, new_dirs, dev_as_test=True)
+                if epoch == args.num_train_epochs-1:
+                    torch.save(model, os.path.join(args.output_dir, "model.pt"))
+                    test(args, args.output_dir, dev_as_test=False)
+                os.remove(os.path.join(new_dirs, "model.pt"))
             if valid_loss<best_valid_loss:
-                torch.save(model, os.path.join(args.output_dir, "model.pt") )
                 best_valid_loss=valid_loss
             model.train()
     if args.do_valid:
@@ -158,11 +209,15 @@ def train(args):
         torch.save(model, os.path.join(args.output_dir, "model.pt") )
 
 
-def test(args):  # Load a trained model that you have fine-tuned (we assume evaluate on cpu)    
+def test(args, new_dirs=None, dev_as_test=None):  # Load a trained model that you have fine-tuned (we assume evaluate on cpu)    
     processor = data_utils.AscProcessor()
     label_list = processor.get_labels()
     tokenizer = BertTokenizer.from_pretrained(modelconfig.MODEL_ARCHIVE_MAP[args.bert_model])
-    eval_examples = processor.get_test_examples(args.data_dir)
+    if dev_as_test:
+        data_dir = os.path.join(args.data_dir, 'dev_as_test')
+    else:
+        data_dir = args.data_dir
+    eval_examples = processor.get_test_examples(data_dir)
     eval_features = data_utils.convert_examples_to_features(eval_examples, label_list, args.max_seq_length, tokenizer, "asc")
 
     logger.info("***** Running evaluation *****")
@@ -177,7 +232,7 @@ def test(args):  # Load a trained model that you have fine-tuned (we assume eval
     eval_sampler = SequentialSampler(eval_data)
     eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
 
-    model = torch.load(os.path.join(args.output_dir, "model.pt") )
+    model = torch.load(os.path.join(new_dirs, "model.pt"))
     model.cuda()
     model.eval()
     
@@ -193,12 +248,14 @@ def test(args):  # Load a trained model that you have fine-tuned (we assume eval
         logits = logits.detach().cpu().numpy()
         label_ids = label_ids.cpu().numpy()
 
-        full_logits.extend(logits.tolist() )
-        full_label_ids.extend(label_ids.tolist() )
+        full_logits.extend(logits.tolist())
+        full_label_ids.extend(label_ids.tolist())
 
-    output_eval_json = os.path.join(args.output_dir, "predictions.json") 
+    output_eval_json = os.path.join(new_dirs, "predictions.json") 
     with open(output_eval_json, "w") as fw:
         json.dump({"logits": full_logits, "label_ids": full_label_ids}, fw)
+    
+    
 
 
 
