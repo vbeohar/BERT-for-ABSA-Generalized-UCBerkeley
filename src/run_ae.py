@@ -21,16 +21,17 @@ import random
 import json
 from math import ceil
 import numpy as np
+import torch.nn as nn
 import torch
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
-from pytorch_pretrained_bert.optimization import BertAdam
-from pytorch_pretrained_bert.tokenization import BertTokenizer
-from pytorch_pretrained_bert.modeling import BertPreTrainedModel, BertModel
+from optimization import BertAdam
+from tokenization import BertTokenizer
+from modeling import BertModel, BertLayer, BertPreTrainedModel
 import absa_data_utils as data_utils
 from absa_data_utils import ABSATokenizer
 import modelconfig
+from torchcrf import CRF
 
-from bat_ae import BertForABSA
 
 logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt = '%m/%d/%Y %H:%M:%S',
@@ -44,16 +45,59 @@ def warmup_linear(x, warmup=0.002):
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-def train(args):
-    # ae laptop best values
-    dropout = 0.0
-    epsilon = 0.2
-    #epoch = 4
 
-    # ae rest best values
-    # dropout = 0.0
-    # epsilon = 5.0
-    # epoch = 8
+class GRoIE(nn.Module):
+    def __init__(self, count, config, num_labels):
+        super(GRoIE, self).__init__()
+        self.count = count
+        self.num_labels = num_labels
+        self.pre_layers = torch.nn.ModuleList()
+        self.crf_layers = torch.nn.ModuleList()
+        self.classifier = torch.nn.Linear(config.hidden_size, num_labels)
+        self.dropout = torch.nn.Dropout(config.hidden_dropout_prob)
+        for i in range(count):
+            self.pre_layers.append(BertLayer(config))
+            self.crf_layers.append(CRF(num_labels))
+
+    def forward(self, layers, attention_mask, labels):
+        losses = []
+        logitses = []
+        for i in range(self.count):
+            layer = self.pre_layers[i](layers[-i-1], attention_mask)
+            layer = self.dropout(layer)
+            logits = self.classifier(layer)
+            if labels is not None:
+                loss = self.crf_layers[i](logits.view(100, -1, self.num_labels), labels.view(100, -1))
+                losses.append(loss)
+            logitses.append(logits)
+        if labels is not None:
+            total_loss = torch.sum(torch.stack(losses), dim=0)
+        else:
+            total_loss = torch.Tensor(0)
+        avg_logits = torch.sum(torch.stack(logitses), dim=0)/self.count
+        return -total_loss, avg_logits
+
+
+class BertForABSA(BertPreTrainedModel):
+    def __init__(self, config, num_labels=3):
+        super(BertForABSA, self).__init__(config)
+        self.num_labels = num_labels
+        self.bert = BertModel(config)
+        self.groie = GRoIE(4, config, num_labels)
+        self.apply(self.init_bert_weights)
+
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None):
+        layers, _, mask = self.bert(input_ids, token_type_ids, 
+                                                        attention_mask=attention_mask, 
+                                                        output_all_encoded_layers=True)
+        loss, logits = self.groie(layers, mask, labels)
+        if labels is not None:
+            return loss
+        else:
+            return logits
+
+
+def train(args):
 
     processor = data_utils.AeProcessor()
     label_list = processor.get_labels()
@@ -101,7 +145,7 @@ def train(args):
         valid_losses=[]
     #<<<<< end of validation declaration
 
-    model = BertForABSA.from_pretrained(modelconfig.MODEL_ARCHIVE_MAP[args.bert_model], num_labels = len(label_list), dropout=dropout, epsilon=epsilon)
+    model = BertForABSA.from_pretrained(modelconfig.MODEL_ARCHIVE_MAP[args.bert_model], num_labels = len(label_list))
     model.to(device)
     # Prepare optimizer
     param_optimizer = [(k, v) for k, v in model.named_parameters() if v.requires_grad==True]
@@ -119,14 +163,12 @@ def train(args):
 
     global_step = 0
     model.train()
-    for _ in range(args.num_train_epochs):
+    for epoch in range(args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             batch = tuple(t.to(device) for t in batch)
             input_ids, segment_ids, input_mask, label_ids = batch
 
-
-            _loss, adv_loss = model(input_ids, segment_ids, input_mask, label_ids)
-            loss = _loss + adv_loss
+            loss = model(input_ids, segment_ids, input_mask, label_ids)
             loss.backward()
             
             lr_this_step = args.learning_rate * warmup_linear(global_step/t_total, args.warmup_proportion)
@@ -136,6 +178,9 @@ def train(args):
             optimizer.zero_grad()
             global_step += 1
             #>>>> perform validation at the end of each epoch .
+        print("training loss: ", loss.item(), epoch+1)
+        new_dirs = os.path.join(args.output_dir, str(epoch+1))
+        os.mkdir(new_dirs)
         if args.do_valid:
             model.eval()
             with torch.no_grad():
@@ -148,10 +193,15 @@ def train(args):
                     losses.append(loss.data.item()*input_ids.size(0) )
                     valid_size+=input_ids.size(0)
                 valid_loss=sum(losses)/valid_size
-                logger.info("validation loss: %f", valid_loss)
+                logger.info("validation loss: %f, epoch: %d", valid_loss, epoch+1)
                 valid_losses.append(valid_loss)
+                torch.save(model, os.path.join(new_dirs, "model.pt"))
+                test(args, new_dirs, dev_as_test=True)
+                if epoch == args.num_train_epochs-1:
+                    torch.save(model, os.path.join(args.output_dir, "model.pt"))
+                    test(args, args.output_dir, dev_as_test=False)
+                os.remove(os.path.join(new_dirs, "model.pt"))
             if valid_loss<best_valid_loss:
-                torch.save(model, os.path.join(args.output_dir, "model.pt") )
                 best_valid_loss=valid_loss
             model.train()
     if args.do_valid:
@@ -161,11 +211,15 @@ def train(args):
         torch.save(model, os.path.join(args.output_dir, "model.pt") )
 
 
-def test(args):  # Load a trained model that you have fine-tuned (we assume evaluate on cpu)    
+def test(args, new_dirs=None, dev_as_test=None):  # Load a trained model that you have fine-tuned (we assume evaluate on cpu)    
     processor = data_utils.AeProcessor()
     label_list = processor.get_labels()
     tokenizer = ABSATokenizer.from_pretrained(modelconfig.MODEL_ARCHIVE_MAP[args.bert_model])
-    eval_examples = processor.get_test_examples(args.data_dir)
+    if dev_as_test:
+        data_dir = os.path.join(args.data_dir, 'dev_as_test')
+    else:
+        data_dir = args.data_dir
+    eval_examples = processor.get_test_examples(data_dir)
     eval_features = data_utils.convert_examples_to_features(eval_examples, label_list, args.max_seq_length, tokenizer, "ae")
 
     logger.info("***** Running evaluation *****")
@@ -180,7 +234,7 @@ def test(args):  # Load a trained model that you have fine-tuned (we assume eval
     eval_sampler = SequentialSampler(eval_data)
     eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
 
-    model = torch.load(os.path.join(args.output_dir, "model.pt") )
+    model = torch.load(os.path.join(new_dirs, "model.pt"))
     model.to(device)
     model.eval()
     
@@ -196,10 +250,10 @@ def test(args):  # Load a trained model that you have fine-tuned (we assume eval
         logits = logits.detach().cpu().numpy()
         label_ids = label_ids.cpu().numpy()
 
-        full_logits.extend(logits.tolist() )
-        full_label_ids.extend(label_ids.tolist() )
+        full_logits.extend(logits.tolist())
+        full_label_ids.extend(label_ids.tolist())
 
-    output_eval_json = os.path.join(args.output_dir, "predictions.json") 
+    output_eval_json = os.path.join(new_dirs, "predictions.json")  
     with open(output_eval_json, "w") as fw:
         assert len(full_logits)==len(eval_examples)
         #sort by original order for evaluation
@@ -207,8 +261,8 @@ def test(args):  # Load a trained model that you have fine-tuned (we assume eval
         for qx, ex in enumerate(eval_examples):
             recs[int(ex.guid.split("-")[1]) ]={"sentence": ex.text_a, "idx_map": ex.idx_map, "logit": full_logits[qx][1:]} #skip the [CLS] tag.
         full_logits=[recs[qx]["logit"] for qx in range(len(full_logits))]
-        raw_X=[recs[qx]["sentence"] for qx in range(len(eval_examples) ) ]
-        idx_map=[recs[qx]["idx_map"] for qx in range(len(eval_examples)) ]
+        raw_X=[recs[qx]["sentence"] for qx in range(len(eval_examples) )]
+        idx_map=[recs[qx]["idx_map"] for qx in range(len(eval_examples))]
         json.dump({"logits": full_logits, "raw_X": raw_X, "idx_map": idx_map}, fw)
 
 def main():    
