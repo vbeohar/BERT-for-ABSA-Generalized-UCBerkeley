@@ -25,7 +25,9 @@ import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 
 from tokenization import BertTokenizer
-from modeling import BertModel, BertPreTrainedModel, BertLayer, BertPooler
+# from modeling import BertModel, BertPreTrainedModel, BertLayer, BertPooler
+from modeling import BertLayer, BertPooler
+from transformers import RobertaTokenizer, RobertaModel, RobertaPreTrainedModel
 from optimization import BertAdam
 
 import absa_data_utils as data_utils
@@ -43,6 +45,10 @@ def warmup_linear(x, warmup=0.002):
     if x < warmup:
         return x/warmup
     return 1.0 - x
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+print(f"Using device {device}")
+# device = torch.device("cpu")
 
 class GRoIE(nn.Module):
     def __init__(self, count, config, num_labels):
@@ -75,20 +81,71 @@ class GRoIE(nn.Module):
         avg_logits = torch.sum(torch.stack(logitses), dim=0)/self.count
         return total_loss, avg_logits
 
+class HSUM(nn.Module):
+    def __init__(self, count, config, num_labels):
+        super(HSUM, self).__init__()
+        self.count = count
+        self.num_labels = num_labels
+        self.pre_layers = torch.nn.ModuleList()
+        self.loss_fct = torch.nn.ModuleList()
+        self.pooler = BertPooler(config)
+        self.classifier = torch.nn.Linear(config.hidden_size, num_labels)
+        for i in range(count):
+            self.pre_layers.append(BertLayer(config))
+            self.loss_fct.append(torch.nn.CrossEntropyLoss(ignore_index=-1))
 
-class BertForABSA(BertPreTrainedModel):
+    def forward(self, layers, attention_mask, labels):
+        losses = []
+        logitses = []
+        output = torch.zeros_like(layers[0])
+        total_loss = torch.Tensor(0)
+        for i in range(self.count):
+            output = output + layers[-i-1]
+            output = self.pre_layers[i](output, attention_mask)
+            out = self.pooler(output)
+            logits = self.classifier(out)
+            if labels is not None:
+                loss = self.loss_fct[i](logits.view(-1, self.num_labels), labels.view(-1))
+                losses.append(loss)
+            logitses.append(logits)
+        if labels is not None:
+            total_loss = torch.sum(torch.stack(losses), dim=0)
+        avg_logits = torch.sum(torch.stack(logitses), dim=0)/self.count
+        return total_loss, avg_logits
+
+
+class BertForABSA(RobertaPreTrainedModel):
     def __init__(self, config, num_labels=3):
         super(BertForABSA, self).__init__(config)
         self.num_labels = num_labels
-        self.bert = BertModel(config)
+        self.roberta = RobertaModel(config)
         self.groie = GRoIE(4, config, num_labels)
-        self.apply(self.init_bert_weights)
+        self.apply(self._init_weights)
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None):
-        layers, _, mask = self.bert(input_ids, token_type_ids, 
-                                                        attention_mask=attention_mask, 
-                                                        output_all_encoded_layers=True)
-        loss, logits = self.groie(layers, mask, labels)
+        # model_outputs = self.roberta(input_ids, token_type_ids=token_type_ids, 
+        #                                                 attention_mask=attention_mask, 
+        #                                                 output_hidden_states=True,
+        #                                                 output_attentions=True)
+        model_outputs = self.roberta(input_ids, attention_mask=attention_mask, 
+                                                        output_hidden_states=True,
+                                                        output_attentions=True)
+        # We create a 3D attention mask from a 2D tensor mask.
+        # Sizes are [batch_size, 1, 1, to_seq_length]
+        # So we can broadcast to [batch_size, num_heads, from_seq_length, to_seq_length]
+        # this attention mask is more simple than the triangular masking of causal attention
+        # used in OpenAI GPT, we just need to prepare the broadcast dimension here.
+        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+
+        # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
+        # masked positions, this operation will create a tensor which is 0.0 for
+        # positions we want to attend and -10000.0 for masked positions.
+        # Since we are adding it to the raw scores before the softmax, this is
+        # effectively the same as removing these entirely.
+        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype) # fp16 compatibility
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        
+        loss, logits = self.groie(model_outputs.hidden_states, extended_attention_mask, labels)
         if labels is not None:
             return loss
         else:
@@ -98,14 +155,16 @@ def train(args):
 
     processor = data_utils.AscProcessor()
     label_list = processor.get_labels()
-    tokenizer = ABSATokenizer.from_pretrained(modelconfig.MODEL_ARCHIVE_MAP[args.bert_model])
+    tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
     train_examples = processor.get_train_examples(args.data_dir)
     num_train_steps = int(len(train_examples) / args.train_batch_size) * args.num_train_epochs
-
+    
     train_features = data_utils.convert_examples_to_features(
         train_examples, label_list, args.max_seq_length, tokenizer, "asc")
     logger.info("***** Running training *****")
     logger.info("  Num examples = %d", len(train_examples))
+    # logger.info("    Examples look like %s", str(train_features[0].input_ids))
+    # logger.info(f"    Lables look like {train_features[0].label_id}")
     logger.info("  Batch size = %d", args.train_batch_size)
     logger.info("  Num steps = %d", num_train_steps)
     
@@ -114,6 +173,19 @@ def train(args):
     all_input_mask = torch.tensor([f.input_mask for f in train_features], dtype=torch.long)
     all_label_ids = torch.tensor([f.label_id for f in train_features], dtype=torch.long)
     
+    # logger.info(f"  Maximum input_id is {max([max(f.input_ids) for f in train_features])}")
+    # logger.info(f"  Minimum input_id is {min([min(f.input_ids) for f in train_features])}")
+    
+    bad_inputs = []
+    for i in train_features:
+        if len(i.input_ids) != 100:
+            bad_inputs.append((i, i.input_ids))
+    
+    if len(bad_inputs) > 0:
+        raise IndexError(f" Bad Inputs recieved! See the following: \n{bad_inputs}")
+    
+    logger.info(f"  Maximum label is {max([f.label_id for f in train_features])}")
+    logger.info(f"  Minimum label is {min([f.label_id for f in train_features])}")
     train_data = TensorDataset(all_input_ids, all_segment_ids, all_input_mask, all_label_ids)
 
     train_sampler = RandomSampler(train_data)
@@ -142,9 +214,12 @@ def train(args):
         valid_losses=[]
     #<<<<< end of validation declaration
 
-    model = BertForABSA.from_pretrained(modelconfig.MODEL_ARCHIVE_MAP[args.bert_model], num_labels=len(label_list))
-    model.cuda()
+    model = BertForABSA.from_pretrained("roberta-base", num_labels=len(label_list))
+    # logger.info("***** Preparing Model *****")
+    # logger.info("  Sending model to device...")
+    model.to(device)
     # Prepare optimizer
+    # logger.info("  Preparing optimizer...")
     param_optimizer = [(k, v) for k, v in model.named_parameters() if v.requires_grad==True]
     param_optimizer = [n for n in param_optimizer if 'pooler' not in n[0]]
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
@@ -159,14 +234,27 @@ def train(args):
                          t_total=t_total)
 
     global_step = 0
+    # logger.info("***** Training Model *****")    
+    # logger.info("  Initial Training...")
     model.train()
 
     for epoch in range(args.num_train_epochs):
+        logger.info(f"  Training Epoch {epoch}")
         for step, batch in enumerate(train_dataloader):
-            batch = tuple(t.cuda() for t in batch)
+            batch = tuple(t.to(device) for t in batch)
             input_ids, segment_ids, input_mask, label_ids = batch
+            # logger.info(f"  Model looks like {model}")
+            # logger.info(f"  Model embeddings like {model.roberta.embeddings.word_embeddings.__dict__}")
+            # logger.info(f"  Input Ids min {torch.min(input_ids)}")
+            # logger.info(f"  Input Ids max {torch.max(input_ids)}")
+            # logger.info(f"  Segment Ids min {torch.min(segment_ids)}")
+            # logger.info(f"  Segment Ids max {torch.max(segment_ids)}")
+            # logger.info(f"  Input Mask min {torch.min(input_mask)}")
+            # logger.info(f"  Input Mask max {torch.max(input_mask)}")
+            # logger.info(f"  Label Ids min {torch.min(label_ids)}")
+            # logger.info(f"  Label Ids max {torch.max(label_ids)}")
             optimizer.zero_grad()
-            loss = model(input_ids, segment_ids, input_mask, label_ids)
+            loss = model(input_ids, token_type_ids=segment_ids, attention_mask=input_mask, labels=label_ids)
             loss.backward()
             
             lr_this_step = args.learning_rate * warmup_linear(global_step/t_total, args.warmup_proportion)
@@ -184,7 +272,7 @@ def train(args):
                 losses=[]
                 valid_size=0
                 for step, batch in enumerate(valid_dataloader):
-                    batch = tuple(t.cuda() for t in batch) # multi-gpu does scattering it-self
+                    batch = tuple(t.to(device) for t in batch) # multi-gpu does scattering it-self
                     input_ids, segment_ids, input_mask, label_ids = batch
                     loss = model(input_ids, segment_ids, input_mask, label_ids)
                     losses.append(loss.data.item()*input_ids.size(0) )
@@ -205,13 +293,14 @@ def train(args):
         with open(os.path.join(args.output_dir, "valid.json"), "w") as fw:
             json.dump({"valid_losses": valid_losses}, fw)
     else:
+        logger.info(f"saving model to {args.output_dir}")
         torch.save(model, os.path.join(args.output_dir, "model.pt") )
 
 
 def test(args, new_dirs=None, dev_as_test=None):  # Load a trained model that you have fine-tuned (we assume evaluate on cpu)    
     processor = data_utils.AscProcessor()
     label_list = processor.get_labels()
-    tokenizer = BertTokenizer.from_pretrained(modelconfig.MODEL_ARCHIVE_MAP[args.bert_model])
+    tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
     if dev_as_test:
         data_dir = os.path.join(args.data_dir, 'dev_as_test')
     else:
@@ -232,7 +321,7 @@ def test(args, new_dirs=None, dev_as_test=None):  # Load a trained model that yo
     eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
 
     model = torch.load(os.path.join(new_dirs, "model.pt"))
-    model.cuda()
+    model.to(device)
     model.eval()
     
     full_logits=[]
@@ -261,7 +350,7 @@ def test(args, new_dirs=None, dev_as_test=None):  # Load a trained model that yo
 def main():    
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--bert_model", default='bert-base', type=str)
+    parser.add_argument("--bert_model", default='roberta-base', type=str)
 
     parser.add_argument("--data_dir",
                         default=None,

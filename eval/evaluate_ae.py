@@ -139,6 +139,8 @@ def evaluate(pred_fn, command, template):
     for ix, logit in enumerate(pred_json["logits"]):
         pred=[0]*len(pred_json["raw_X"][ix])
         for jx, idx in enumerate(pred_json["idx_map"][ix]):
+            if jx>=len(logit):
+                continue
             lb=np.argmax(logit[jx])
             if lb==1: #B
                 pred[idx]=1

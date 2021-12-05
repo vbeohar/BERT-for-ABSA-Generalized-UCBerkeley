@@ -25,8 +25,11 @@ import torch.nn as nn
 import torch
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 from optimization import BertAdam
-from tokenization import BertTokenizer
-from modeling import BertModel, BertLayer, BertPreTrainedModel
+# from tokenization import BertTokenizer
+# from modeling import BertModel, BertLayer, BertPreTrainedModel
+from modeling import BertLayer
+from transformers import RobertaTokenizer, RobertaModel, RobertaPreTrainedModel
+
 import absa_data_utils as data_utils
 from absa_data_utils import ABSATokenizer
 import modelconfig
@@ -44,7 +47,6 @@ def warmup_linear(x, warmup=0.002):
     return 1.0 - x
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
 
 class GRoIE(nn.Module):
     def __init__(self, count, config, num_labels):
@@ -77,34 +79,80 @@ class GRoIE(nn.Module):
         avg_logits = torch.sum(torch.stack(logitses), dim=0)/self.count
         return -total_loss, avg_logits
 
+class HSUM(nn.Module):
+    def __init__(self, count, config, num_labels):
+        super(HSUM, self).__init__()
+        self.count = count
+        self.num_labels = num_labels
+        self.pre_layers = torch.nn.ModuleList()
+        self.crf_layers = torch.nn.ModuleList()
+        self.classifier = torch.nn.Linear(config.hidden_size, num_labels)
+        for i in range(count):
+            self.pre_layers.append(BertLayer(config))
+            self.crf_layers.append(CRF(num_labels))
 
-class BertForABSA(BertPreTrainedModel):
+    def forward(self, layers, attention_mask, labels):
+        losses = []
+        logitses = []
+        output = torch.zeros_like(layers[0])
+        total_loss = torch.Tensor(0)
+        for i in range(self.count):
+            output = output + layers[-i-1]
+            output = self.pre_layers[i](output, attention_mask)
+            logits = self.classifier(output)
+            if labels is not None:
+                loss = self.crf_layers[i](logits.view(100, -1, self.num_labels), labels.view(100, -1))
+                losses.append(loss)
+            logitses.append(logits)
+        if labels is not None:
+            total_loss = torch.sum(torch.stack(losses), dim=0) 
+        avg_logits = torch.sum(torch.stack(logitses), dim=0)/self.count
+        return -total_loss, avg_logits
+
+
+class BertForABSA(RobertaPreTrainedModel):
     def __init__(self, config, num_labels=3):
         super(BertForABSA, self).__init__(config)
         self.num_labels = num_labels
-        self.bert = BertModel(config)
+        self.roberta = RobertaModel(config)
         self.groie = GRoIE(4, config, num_labels)
-        self.apply(self.init_bert_weights)
+        self.apply(self._init_weights)
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None):
-        layers, _, mask = self.bert(input_ids, token_type_ids, 
+        model_outputs = self.roberta(input_ids, token_type_ids=token_type_ids, 
                                                         attention_mask=attention_mask, 
-                                                        output_all_encoded_layers=True)
-        loss, logits = self.groie(layers, mask, labels)
+                                                        output_hidden_states=True,
+                                                        output_attentions=True)
+        
+        # We create a 3D attention mask from a 2D tensor mask.
+        # Sizes are [batch_size, 1, 1, to_seq_length]
+        # So we can broadcast to [batch_size, num_heads, from_seq_length, to_seq_length]
+        # this attention mask is more simple than the triangular masking of causal attention
+        # used in OpenAI GPT, we just need to prepare the broadcast dimension here.
+        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+
+        # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
+        # masked positions, this operation will create a tensor which is 0.0 for
+        # positions we want to attend and -10000.0 for masked positions.
+        # Since we are adding it to the raw scores before the softmax, this is
+        # effectively the same as removing these entirely.
+        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype) # fp16 compatibility
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        
+        loss, logits = self.groie(model_outputs.hidden_states, extended_attention_mask, labels)
         if labels is not None:
             return loss
         else:
             return logits
 
-
 def train(args):
 
     processor = data_utils.AeProcessor()
     label_list = processor.get_labels()
-    tokenizer = ABSATokenizer.from_pretrained(modelconfig.MODEL_ARCHIVE_MAP[args.bert_model])
+    tokenizer = ABSATokenizer.from_pretrained("roberta-base")
     train_examples = processor.get_train_examples(args.data_dir)
     num_train_steps = int(len(train_examples) / args.train_batch_size) * args.num_train_epochs
-
+    
     train_features = data_utils.convert_examples_to_features(
         train_examples, label_list, args.max_seq_length, tokenizer, "ae")
     logger.info("***** Running training *****")
@@ -145,7 +193,7 @@ def train(args):
         valid_losses=[]
     #<<<<< end of validation declaration
 
-    model = BertForABSA.from_pretrained(modelconfig.MODEL_ARCHIVE_MAP[args.bert_model], num_labels = len(label_list))
+    model = BertForABSA.from_pretrained("roberta-base", num_labels = len(label_list))
     model.to(device)
     # Prepare optimizer
     param_optimizer = [(k, v) for k, v in model.named_parameters() if v.requires_grad==True]
@@ -163,11 +211,12 @@ def train(args):
 
     global_step = 0
     model.train()
+    
     for epoch in range(args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             batch = tuple(t.to(device) for t in batch)
             input_ids, segment_ids, input_mask, label_ids = batch
-
+            
             loss = model(input_ids, segment_ids, input_mask, label_ids)
             loss.backward()
             
@@ -214,7 +263,7 @@ def train(args):
 def test(args, new_dirs=None, dev_as_test=None):  # Load a trained model that you have fine-tuned (we assume evaluate on cpu)    
     processor = data_utils.AeProcessor()
     label_list = processor.get_labels()
-    tokenizer = ABSATokenizer.from_pretrained(modelconfig.MODEL_ARCHIVE_MAP[args.bert_model])
+    tokenizer = ABSATokenizer.from_pretrained("roberta-base")
     if dev_as_test:
         data_dir = os.path.join(args.data_dir, 'dev_as_test')
     else:
@@ -259,6 +308,8 @@ def test(args, new_dirs=None, dev_as_test=None):  # Load a trained model that yo
         #sort by original order for evaluation
         recs={}
         for qx, ex in enumerate(eval_examples):
+            # Need to reconstruct idx_map because not generated by BPE tokenizer
+            # ex.idx_map = list(range(len(ex.text_a))) # idx_map is 1-to-1 because no subwordization
             recs[int(ex.guid.split("-")[1]) ]={"sentence": ex.text_a, "idx_map": ex.idx_map, "logit": full_logits[qx][1:]} #skip the [CLS] tag.
         full_logits=[recs[qx]["logit"] for qx in range(len(full_logits))]
         raw_X=[recs[qx]["sentence"] for qx in range(len(eval_examples) )]
@@ -268,7 +319,7 @@ def test(args, new_dirs=None, dev_as_test=None):  # Load a trained model that yo
 def main():    
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--bert_model", default='bert-base', type=str)
+    parser.add_argument("--bert_model", default='roberta-base', type=str)
 
     parser.add_argument("--data_dir",
                         default=None,

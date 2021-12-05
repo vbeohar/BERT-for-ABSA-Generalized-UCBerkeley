@@ -18,15 +18,15 @@ import json
 import os
 from collections import defaultdict
 import random
+from transformers import RobertaTokenizer
+# from pytorch_pretrained_bert.tokenization import BertTokenizer
 
-from pytorch_pretrained_bert.tokenization import BertTokenizer
-
-class ABSATokenizer(BertTokenizer):     
+class ABSATokenizer(RobertaTokenizer):     
     def subword_tokenize(self, tokens, labels): # for AE
         split_tokens, split_labels= [], []
         idx_map=[]
         for ix, token in enumerate(tokens):
-            sub_tokens=self.wordpiece_tokenizer.tokenize(token)
+            sub_tokens=self.tokenize(token)
             for jx, sub_token in enumerate(sub_tokens):
                 split_tokens.append(sub_token)
                 if labels[ix]=="B" and jx>0:
@@ -171,9 +171,11 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
     for (ex_index, example) in enumerate(examples):
         if mode!="ae":
             tokens_a = tokenizer.tokenize(example.text_a)
-        else: #only do subword tokenization.
+        else: 
+            #only do subword tokenization.
             tokens_a, labels_a, example.idx_map= tokenizer.subword_tokenize([token.lower() for token in example.text_a], example.label )
 
+        
         tokens_b = None
         if example.text_b:
             tokens_b = tokenizer.tokenize(example.text_b)
@@ -181,8 +183,8 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
         if tokens_b:
             # Modifies `tokens_a` and `tokens_b` in place so that the total
             # length is less than the specified length.
-            # Account for [CLS], [SEP], [SEP] with "- 3"
-            _truncate_seq_pair(tokens_a, tokens_b, max_seq_length - 3)
+            # Account for [CLS], [SEP], [SEP], [SEP] with "- 4"
+            _truncate_seq_pair(tokens_a, tokens_b, max_seq_length - 4)
         else:
             # Account for [CLS] and [SEP] with "- 2"
             if len(tokens_a) > max_seq_length - 2:
@@ -190,19 +192,21 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
 
         tokens = []
         segment_ids = []
-        tokens.append("[CLS]")
+        tokens.append("<s>")
         segment_ids.append(0)
         for token in tokens_a:
             tokens.append(token)
             segment_ids.append(0)
-        tokens.append("[SEP]")
+        tokens.append("</s>")
         segment_ids.append(0)
 
         if tokens_b:
+            tokens.append("</s>")
+            segment_ids.append(1)
             for token in tokens_b:
                 tokens.append(token)
                 segment_ids.append(1)
-            tokens.append("[SEP]")
+            tokens.append("</s>")
             segment_ids.append(1)
 
         input_ids = tokenizer.convert_tokens_to_ids(tokens)
@@ -213,7 +217,7 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
 
         # Zero-pad up to the sequence length.
         while len(input_ids) < max_seq_length:
-            input_ids.append(0)
+            input_ids.append(1)
             input_mask.append(0)
             segment_ids.append(0)
 
@@ -237,6 +241,7 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
                         input_mask=input_mask,
                         segment_ids=segment_ids,
                         label_id=label_id))
+    # print(len(tokenizer))
     return features
 
 
