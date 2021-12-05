@@ -2,8 +2,7 @@
 ## Generalizing improvements in Aspect-Based Sentiment Analysis
 ### W266 / UC Berkeley - MIDS - Fall 2021
 
-# Adversarial Training for Aspect-Based Sentiment Analysis with BERT
-Code for "[Adversarial Training for Aspect-Based Sentiment Analysis with BERT](https://arxiv.org/pdf/2001.11316)".
+Codebase enhanced and built on the "Adversarial Training for Aspect-Based Sentiment Analysis with BERT" work by Karimi et al. ("[Adversarial Training for Aspect-Based Sentiment Analysis with BERT](https://arxiv.org/pdf/2001.11316)").
 
 We have used the codebase from the following paper and improved upon their results by applying adversarial training.
 "[BERT Post-Training for Review Reading Comprehension and Aspect-based Sentiment Analysis](https://www.aclweb.org/anthology/N19-1242.pdf)".
