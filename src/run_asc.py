@@ -25,8 +25,13 @@ import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 
 from tokenization import BertTokenizer
-from modeling import BertModel, BertPreTrainedModel, BertLayer, BertPooler
+# from modeling import BertModel, BertPreTrainedModel, BertLayer, BertPooler
+from modeling import BertLayer, BertPooler
+# from transformers import RobertaTokenizer, RobertaModel, RobertaPreTrainedModel
+from transformers import BertTokenizer, BertModel, BertPreTrainedModel
 from optimization import BertAdam
+from transformers import BertTokenizer, BertModel, BertPreTrainedModel
+from transformers import AutoTokenizer, AutoModel
 
 import absa_data_utils as data_utils
 from absa_data_utils import ABSATokenizer
@@ -43,6 +48,41 @@ def warmup_linear(x, warmup=0.002):
     if x < warmup:
         return x/warmup
     return 1.0 - x
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+class HSUM(nn.Module):
+    def __init__(self, count, config, num_labels):
+        super(HSUM, self).__init__()
+        self.count = count
+        self.num_labels = num_labels
+        self.pre_layers = torch.nn.ModuleList()
+        self.loss_fct = torch.nn.ModuleList()
+        self.pooler = BertPooler(config)
+        self.classifier = torch.nn.Linear(config.hidden_size, num_labels)
+        for i in range(count):
+            self.pre_layers.append(BertLayer(config))
+            self.loss_fct.append(torch.nn.CrossEntropyLoss(ignore_index=-1))
+
+    def forward(self, layers, attention_mask, labels):
+        losses = []
+        logitses = []
+        output = torch.zeros_like(layers[0])
+        total_loss = torch.Tensor(0)
+        for i in range(self.count):
+            output = output + layers[-i-1]
+            output = self.pre_layers[i](output, attention_mask)
+            out = self.pooler(output)
+            logits = self.classifier(out)
+            if labels is not None:
+                loss = self.loss_fct[i](logits.view(-1, self.num_labels), labels.view(-1))
+                losses.append(loss)
+            logitses.append(logits)
+        if labels is not None:
+            total_loss = torch.sum(torch.stack(losses), dim=0)
+        avg_logits = torch.sum(torch.stack(logitses), dim=0)/self.count
+        return total_loss, avg_logits
+
 
 class GRoIE(nn.Module):
     def __init__(self, count, config, num_labels):
@@ -82,13 +122,30 @@ class BertForABSA(BertPreTrainedModel):
         self.num_labels = num_labels
         self.bert = BertModel(config)
         self.groie = GRoIE(4, config, num_labels)
-        self.apply(self.init_bert_weights)
+        self.apply(self._init_weights)
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None):
-        layers, _, mask = self.bert(input_ids, token_type_ids, 
-                                                        attention_mask=attention_mask, 
-                                                        output_all_encoded_layers=True)
-        loss, logits = self.groie(layers, mask, labels)
+        model_outputs = self.bert(input_ids, token_type_ids=token_type_ids,
+                                                        attention_mask=attention_mask,
+                                                        output_hidden_states=True,
+                                                        output_attentions=True)
+
+        # We create a 3D attention mask from a 2D tensor mask.
+        # Sizes are [batch_size, 1, 1, to_seq_length]
+        # So we can broadcast to [batch_size, num_heads, from_seq_length, to_seq_length]
+        # this attention mask is more simple than the triangular masking of causal attention
+        # used in OpenAI GPT, we just need to prepare the broadcast dimension here.
+        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+
+        # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
+        # masked positions, this operation will create a tensor which is 0.0 for
+        # positions we want to attend and -10000.0 for masked positions.
+        # Since we are adding it to the raw scores before the softmax, this is
+        # effectively the same as removing these entirely.
+        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype) # fp16 compatibility
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+
+        loss, logits = self.groie(model_outputs.hidden_states, extended_attention_mask, labels)
         if labels is not None:
             return loss
         else:
@@ -98,7 +155,11 @@ def train(args):
 
     processor = data_utils.AscProcessor()
     label_list = processor.get_labels()
-    tokenizer = ABSATokenizer.from_pretrained(modelconfig.MODEL_ARCHIVE_MAP[args.bert_model])
+    # tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
+    # tokenizer = BertTokenizer.from_pretrained('bert-base-uncased', do_lower_case=True)
+    # tokenizer = AutoTokenizer.from_pretrained('SpanBERT/spanbert-base-cased', do_lower_case=True)
+    tokenizer = ABSATokenizer.from_pretrained('SpanBERT/spanbert-base-cased')
+
     train_examples = processor.get_train_examples(args.data_dir)
     num_train_steps = int(len(train_examples) / args.train_batch_size) * args.num_train_epochs
 
@@ -108,17 +169,17 @@ def train(args):
     logger.info("  Num examples = %d", len(train_examples))
     logger.info("  Batch size = %d", args.train_batch_size)
     logger.info("  Num steps = %d", num_train_steps)
-    
+
     all_input_ids = torch.tensor([f.input_ids for f in train_features], dtype=torch.long)
     all_segment_ids = torch.tensor([f.segment_ids for f in train_features], dtype=torch.long)
     all_input_mask = torch.tensor([f.input_mask for f in train_features], dtype=torch.long)
     all_label_ids = torch.tensor([f.label_id for f in train_features], dtype=torch.long)
-    
+
     train_data = TensorDataset(all_input_ids, all_segment_ids, all_input_mask, all_label_ids)
 
     train_sampler = RandomSampler(train_data)
     train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size)
-    
+
     #>>>>> validation
     if args.do_valid:
         valid_examples = processor.get_dev_examples(args.data_dir)
@@ -136,14 +197,16 @@ def train(args):
         logger.info("  Batch size = %d", args.train_batch_size)
 
         valid_sampler = SequentialSampler(valid_data)
-        valid_dataloader = DataLoader(valid_data, sampler=valid_sampler, batch_size=args.train_batch_size)    
+        valid_dataloader = DataLoader(valid_data, sampler=valid_sampler, batch_size=args.train_batch_size)
 
         best_valid_loss=float('inf')
         valid_losses=[]
     #<<<<< end of validation declaration
 
-    model = BertForABSA.from_pretrained(modelconfig.MODEL_ARCHIVE_MAP[args.bert_model], num_labels=len(label_list))
-    model.cuda()
+    # model = BertForABSA.from_pretrained("roberta-base", num_labels=len(label_list))
+    # model = BertForABSA.from_pretrained("bert-base-uncased", num_labels = len(label_list))
+    model = BertForABSA.from_pretrained("SpanBERT/spanbert-base-cased", num_labels = len(label_list))
+    model.to(device)
     # Prepare optimizer
     param_optimizer = [(k, v) for k, v in model.named_parameters() if v.requires_grad==True]
     param_optimizer = [n for n in param_optimizer if 'pooler' not in n[0]]
@@ -163,12 +226,12 @@ def train(args):
 
     for epoch in range(args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
-            batch = tuple(t.cuda() for t in batch)
+            batch = tuple(t.to(device) for t in batch)
             input_ids, segment_ids, input_mask, label_ids = batch
             optimizer.zero_grad()
             loss = model(input_ids, segment_ids, input_mask, label_ids)
             loss.backward()
-            
+
             lr_this_step = args.learning_rate * warmup_linear(global_step/t_total, args.warmup_proportion)
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr_this_step
@@ -184,7 +247,7 @@ def train(args):
                 losses=[]
                 valid_size=0
                 for step, batch in enumerate(valid_dataloader):
-                    batch = tuple(t.cuda() for t in batch) # multi-gpu does scattering it-self
+                    batch = tuple(t.to(device) for t in batch) # multi-gpu does scattering it-self
                     input_ids, segment_ids, input_mask, label_ids = batch
                     loss = model(input_ids, segment_ids, input_mask, label_ids)
                     losses.append(loss.data.item()*input_ids.size(0) )
@@ -208,10 +271,14 @@ def train(args):
         torch.save(model, os.path.join(args.output_dir, "model.pt") )
 
 
-def test(args, new_dirs=None, dev_as_test=None):  # Load a trained model that you have fine-tuned (we assume evaluate on cpu)    
+def test(args, new_dirs=None, dev_as_test=None):  # Load a trained model that you have fine-tuned (we assume evaluate on cpu)
     processor = data_utils.AscProcessor()
     label_list = processor.get_labels()
-    tokenizer = BertTokenizer.from_pretrained(modelconfig.MODEL_ARCHIVE_MAP[args.bert_model])
+    # tokenizer = BertTokenizer.from_pretrained(modelconfig.MODEL_ARCHIVE_MAP[args.bert_model])
+    # tokenizer = BertTokenizer.from_pretrained('bert-base-uncased', do_lower_case=True)
+    # tokenizer = AutoTokenizer.from_pretrained('SpanBERT/spanbert-base-cased', do_lower_case=True)
+    tokenizer = ABSATokenizer.from_pretrained('SpanBERT/spanbert-base-cased')
+
     if dev_as_test:
         data_dir = os.path.join(args.data_dir, 'dev_as_test')
     else:
@@ -232,15 +299,15 @@ def test(args, new_dirs=None, dev_as_test=None):  # Load a trained model that yo
     eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
 
     model = torch.load(os.path.join(new_dirs, "model.pt"))
-    model.cuda()
+    model.to(device)
     model.eval()
-    
+
     full_logits=[]
     full_label_ids=[]
     for step, batch in enumerate(eval_dataloader):
         batch = tuple(t.cuda() for t in batch)
         input_ids, segment_ids, input_mask, label_ids = batch
-        
+
         with torch.no_grad():
             logits = model(input_ids, segment_ids, input_mask)
 
@@ -250,18 +317,20 @@ def test(args, new_dirs=None, dev_as_test=None):  # Load a trained model that yo
         full_logits.extend(logits.tolist())
         full_label_ids.extend(label_ids.tolist())
 
-    output_eval_json = os.path.join(new_dirs, "predictions.json") 
+    output_eval_json = os.path.join(new_dirs, "predictions.json")
     with open(output_eval_json, "w") as fw:
         json.dump({"logits": full_logits, "label_ids": full_label_ids}, fw)
-    
-    
 
 
 
-def main():    
+
+
+def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--bert_model", default='bert-base', type=str)
+    # parser.add_argument("--bert_model", default='roberta-base', type=str)
+    # parser.add_argument("--bert_model", default='bert-base-uncased', type=str)
+    parser.add_argument("--bert_model", default='spanbert-base-cased', type=str)
 
     parser.add_argument("--data_dir",
                         default=None,
@@ -294,7 +363,7 @@ def main():
                         default=False,
                         action='store_true',
                         help="Whether to run eval on the dev set.")
-    
+
     parser.add_argument("--train_batch_size",
                         default=32,
                         type=int,
@@ -307,7 +376,7 @@ def main():
                         default=3e-5,
                         type=float,
                         help="The initial learning rate for Adam.")
-    
+
     parser.add_argument("--num_train_epochs",
                         default=6,
                         type=int,
@@ -321,9 +390,9 @@ def main():
                         type=int,
                         default=0,
                         help="random seed for initialization")
-    
+
     args = parser.parse_args()
-    
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -333,6 +402,6 @@ def main():
         train(args)
     if args.do_eval:
         test(args)
-            
+
 if __name__=="__main__":
     main()

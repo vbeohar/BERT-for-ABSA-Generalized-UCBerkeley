@@ -18,10 +18,11 @@ import json
 import os
 from collections import defaultdict
 import random
+# from transformers import RobertaTokenizer
+#from pytorch_pretrained_bert.tokenization import BertTokenizer
+from transformers import BertTokenizer
 
-from pytorch_pretrained_bert.tokenization import BertTokenizer
-
-class ABSATokenizer(BertTokenizer):     
+class ABSATokenizer(BertTokenizer):
     def subword_tokenize(self, tokens, labels): # for AE
         split_tokens, split_labels= [], []
         idx_map=[]
@@ -77,7 +78,7 @@ class DataProcessor(object):
     def get_dev_examples(self, data_dir):
         """Gets a collection of `InputExample`s for the dev set."""
         raise NotImplementedError()
-        
+
     def get_test_examples(self, data_dir):
         """Gets a collection of `InputExample`s for the test set."""
         raise NotImplementedError()
@@ -91,8 +92,8 @@ class DataProcessor(object):
         """Reads a json file for tasks in sentiment analysis."""
         with open(input_file) as f:
             return json.load(f)
-        
-        
+
+
 class AeProcessor(DataProcessor):
     """Processor for the SemEval Aspect Extraction ."""
 
@@ -105,7 +106,7 @@ class AeProcessor(DataProcessor):
         """See base class."""
         return self._create_examples(
             self._read_json(os.path.join(data_dir, fn)), "dev")
-    
+
     def get_test_examples(self, data_dir, fn="test.json"):
         """See base class."""
         return self._create_examples(
@@ -124,8 +125,8 @@ class AeProcessor(DataProcessor):
             label = lines[ids]['label']
             examples.append(
                 InputExample(guid=guid, text_a=text_a, label=label) )
-        return examples        
-        
+        return examples
+
 
 class AscProcessor(DataProcessor):
     """Processor for the SemEval Aspect Sentiment Classification."""
@@ -139,7 +140,7 @@ class AscProcessor(DataProcessor):
         """See base class."""
         return self._create_examples(
             self._read_json(os.path.join(data_dir, fn)), "dev")
-    
+
     def get_test_examples(self, data_dir, fn="test.json"):
         """See base class."""
         return self._create_examples(
@@ -148,7 +149,7 @@ class AscProcessor(DataProcessor):
     def get_labels(self):
         """See base class."""
         return ["positive", "negative", "neutral"]
-    
+
     def _create_examples(self, lines, set_type):
         """Creates examples for the training and dev sets."""
         examples = []
@@ -159,10 +160,10 @@ class AscProcessor(DataProcessor):
             label = lines[ids]['polarity']
             examples.append(
                 InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
-        return examples     
-    
+        return examples
+
 def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer, mode):
-    """Loads a data file into a list of `InputBatch`s.""" #check later if we can merge this function with the SQuAD preprocessing 
+    """Loads a data file into a list of `InputBatch`s.""" #check later if we can merge this function with the SQuAD preprocessing
     label_map = {}
     for (i, label) in enumerate(label_list):
         label_map[label] = i
@@ -171,8 +172,15 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
     for (ex_index, example) in enumerate(examples):
         if mode!="ae":
             tokens_a = tokenizer.tokenize(example.text_a)
-        else: #only do subword tokenization.
+        else:
+        #     #only do subword tokenization.
             tokens_a, labels_a, example.idx_map= tokenizer.subword_tokenize([token.lower() for token in example.text_a], example.label )
+            # tokens_a = tokenizer.tokenize(example.text_a)
+            # replace above for RoBERTa's byte-pair encoding
+            # text_a_str = ""
+            # text_a_str = " ".join(example.text_a)
+            # tokens_a = tokenizer.tokenize(text_a_str)
+            # labels_a = example.label
 
         tokens_b = None
         if example.text_b:
