@@ -39,7 +39,7 @@ def label_rest_xml(fn, output_fn, corpus, label):
                 tag_on=True
             elif token_idx<len(tokens) and (lb[token_idx]==0 or lb[token_idx]==1) and tag_on and pt==0:
                 end=ix
-                tag_on=False
+                tag_on=False 
                 opin=ET.Element("Opinion")
                 opin.attrib['target']=sent.find('text').text[start:end]
                 opin.attrib['from']=str(start)
@@ -47,7 +47,7 @@ def label_rest_xml(fn, output_fn, corpus, label):
                 opins.append(opin)
             elif token_idx>=len(tokens) and tag_on:
                 end=ix
-                tag_on=False
+                tag_on=False 
                 opin=ET.Element("Opinion")
                 opin.attrib['target']=sent.find('text').text[start:end]
                 opin.attrib['from']=str(start)
@@ -101,7 +101,7 @@ def label_laptop_xml(fn, output_fn, corpus, label):
                 tag_on=True
             elif token_idx<len(tokens) and (lb[token_idx]==0 or lb[token_idx]==1) and tag_on and pt==0:
                 end=ix
-                tag_on=False
+                tag_on=False 
                 opin=ET.Element("aspectTerm")
                 opin.attrib['term']=sent.find('text').text[start:end]
                 opin.attrib['from']=str(start)
@@ -109,7 +109,7 @@ def label_laptop_xml(fn, output_fn, corpus, label):
                 opins.append(opin)
             elif token_idx>=len(tokens) and tag_on:
                 end=ix
-                tag_on=False
+                tag_on=False 
                 opin=ET.Element("aspectTerm")
                 opin.attrib['term']=sent.find('text').text[start:end]
                 opin.attrib['from']=str(start)
@@ -132,15 +132,13 @@ def label_laptop_xml(fn, output_fn, corpus, label):
         sent.append(opins )
     dom.write(output_fn)
 
-def evaluate(pred_fn, command, template):
+def evaluate(pred_fn, command, template): 
     with open(pred_fn) as f:
-        pred_json=json.load(f)
+        pred_json=json.load(f)    
     y_pred=[]
     for ix, logit in enumerate(pred_json["logits"]):
         pred=[0]*len(pred_json["raw_X"][ix])
         for jx, idx in enumerate(pred_json["idx_map"][ix]):
-            if jx>=len(logit):
-                continue
             lb=np.argmax(logit[jx])
             if lb==1: #B
                 pred[idx]=1
@@ -148,7 +146,7 @@ def evaluate(pred_fn, command, template):
                 if pred[idx]==0: #only when O->I (I->I and B->I ignored)
                     pred[idx]=2
         y_pred.append(pred)
-
+    
     if 'REST' in command:
         command=command.split()
         label_rest_xml(template, command[6], pred_json["raw_X"], y_pred)
@@ -160,7 +158,7 @@ def evaluate(pred_fn, command, template):
         acc=check_output(command ).split()
         return float(acc[15])
 
-if __name__ == "__main__":
+if __name__ == "__main__":    
     parser = argparse.ArgumentParser()
     parser.add_argument('--pred_json', type=str)
 
