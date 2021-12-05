@@ -6,6 +6,8 @@ Project work for UC Berkeley Masters in Data Science program's ["Natural Languag
 
 Codebase enhanced and built on Karimi et al's "Adversarial Training for Aspect-Based Sentiment Analysis with BERT" work ("[Adversarial Training for Aspect-Based Sentiment Analysis with BERT](https://arxiv.org/pdf/2001.11316)") which consequently improves upon the results from Hu et al ("[BERT Post-Training for Review Reading Comprehension and Aspect-based Sentiment Analysis](https://www.aclweb.org/anthology/N19-1242.pdf)").
 
+In this project we explore recent improvements in Aspect Based Sentiment Analysis (ABSA), which is a subfield of sentiment analysis. We examine a recent paper by Karimi et al. and find that using newer, more general models in the place of more domain-specific models can improve performance on sentiment classification while impairing performance on sentiment target identification.
+
 ## ABSA Tasks
 We focus on two major tasks in Aspect-Based Sentiment Analysis (ABSA).
 
