@@ -22,6 +22,9 @@ Place laptop and restaurant post-trained BERTs into ```pt_model/laptop_pt``` and
 ### In order to run our new models: 
 Switch to branches `spanbert_absa`, `roberta_absa` or `base_bert_absa`. You *do not* need to download post-trained fine-tuned models, as we use HuggingFace libraries (please make sure those packages are installed in your environment).
 
+### For base_bert_absa branch that uses Pretrained BERT (BERT-PT)
+
+Refer to https://github.com/vbeohar/BERT-for-ABSA-Generalized-UCBerkeley/blob/base_bert_absa/pytorch-pretrained-bert.md for instructions
 
 Execute the following command to run the model for Aspect Extraction task:
 
