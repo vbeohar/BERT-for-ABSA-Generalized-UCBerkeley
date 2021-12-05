@@ -1,3 +1,7 @@
+# Aggregation is Not All You Need
+## Generalizing improvements in Aspect-Based Sentiment Analysis
+### W266 / UC Berkeley - MIDS - Fall 2021
+
 # Adversarial Training for Aspect-Based Sentiment Analysis with BERT
 Code for "[Adversarial Training for Aspect-Based Sentiment Analysis with BERT](https://arxiv.org/pdf/2001.11316)".
 
