@@ -20,7 +20,7 @@ Aspect Sentiment Classification (ASC): given an aspect ("retina display") and a 
 Place laptop and restaurant post-trained BERTs into ```pt_model/laptop_pt``` and ```pt_model/rest_pt```, respectively. The post-trained Laptop weights can be download [here](https://drive.google.com/file/d/1io-_zVW3sE6AbKgHZND4Snwh-wi32L4K/view?usp=sharing) and restaurant [here](https://drive.google.com/file/d/1TYk7zOoVEO8Isa6iP0cNtdDFAUlpnTyz/view?usp=sharing).
 
 #### In order to run our new models: 
-Switch to branches `spanbert_absa`, `roberta_absa` or `base_bert_absa`.
+Switch to branches `spanbert_absa`, `roberta_absa` or `base_bert_absa`. You *do not* need to download post-trained fine-tuned models, as we use HuggingFace libraries (please make sure those packages are installed in your environment).
 
 
 Execute the following command to run the model for Aspect Extraction task:
